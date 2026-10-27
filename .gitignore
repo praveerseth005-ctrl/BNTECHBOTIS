@@ -1,0 +1,11 @@
+﻿.env
+.env.*
+!.env.example
+*.zip
+*.bak
+*.backup
+*.log
+__pycache__/
+*.pyc
+venv/
+.venv/
