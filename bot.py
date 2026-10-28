@@ -1,7 +1,12 @@
 import os
 import asyncio
 import logging
+import math
+import re
+import secrets
+import time
 import requests
+from urllib.parse import quote
 from io import BytesIO
 from xml.sax.saxutils import escape
 from reportlab.lib import colors
@@ -40,6 +45,287 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Helpers RECONSTRUCTED from the missing patch_bot.py (see deployment notes).
+# Behaviour was inferred from how bot.py calls them; nothing here verifies
+# payments or delivers products.
+# ---------------------------------------------------------------------------
+WA_MAX_URL_CHARS = 1800
+WA_MAX_TEXT_CHARS = 700
+
+
+def normalize_whatsapp_number(value):
+    """Return digits-only international number (8-15 digits) or None."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if 8 <= len(digits) <= 15 and not digits.startswith("0"):
+        return digits
+    return None
+
+
+def _number_from_wa_url(url):
+    match = re.fullmatch(r"https://wa\.me/(\d{8,15})/?", url or "")
+    return match.group(1) if match else None
+
+
+# Single source of truth: the support number already configured in WHATSAPP_URL.
+WHATSAPP_NUMBER = normalize_whatsapp_number(_number_from_wa_url(WHATSAPP_URL))
+
+
+def _wa_clean(value, limit):
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def build_whatsapp_link(number, product=None, price=None, currency=None,
+                        username=None, telegram_id=None, offer=None):
+    digits = normalize_whatsapp_number(number)
+    if not digits:
+        raise ValueError("Invalid WhatsApp number")
+    lines = ["Hello BN Tech,"]
+    if offer:
+        lines += ["I am interested in this offer:", _wa_clean(offer, 200)]
+    else:
+        lines += ["I want to buy:", _wa_clean(product or "a product", 150)]
+        if price is not None and currency:
+            lines.append(f"Price: {_wa_clean(price, 30)} {_wa_clean(currency, 10)}")
+    if username and re.fullmatch(r"[A-Za-z0-9_]{1,64}", str(username)):
+        lines.append(f"Telegram: @{username}")
+    if telegram_id is not None:
+        try:
+            lines.append(f"Telegram ID: {int(telegram_id)}")
+        except (TypeError, ValueError):
+            pass
+    text = "\n".join(lines)[:WA_MAX_TEXT_CHARS]
+    link = f"https://wa.me/{digits}?text={quote(text, safe='')}"
+    while len(link) > WA_MAX_URL_CHARS and len(text) > 50:
+        text = text[: int(len(text) * 0.8)]
+        link = f"https://wa.me/{digits}?text={quote(text, safe='')}"
+    return link
+
+
+def is_valid_whatsapp_url(url):
+    return (
+        isinstance(url, str)
+        and len(url) <= WA_MAX_URL_CHARS
+        and re.fullmatch(r"https://wa\.me/\d{8,15}(\?text=\S*)?", url) is not None
+    )
+
+
+def stock_value(product):
+    """Return stock as a non-negative-checkable int, or None if unusable."""
+    stock = product.get("stock")
+    if isinstance(stock, bool) or stock is None:
+        return None
+    if isinstance(stock, float) and not stock.is_integer():
+        return None
+    try:
+        return int(stock)
+    except (TypeError, ValueError):
+        return None
+
+
+def stock_label(product):
+    count = stock_value(product)
+    if count is None:
+        return "Stock: Contact us"
+    if count <= 0:
+        return "Stock: Out of stock"
+    return f"Stock: In stock ({count} available)"
+
+
+def _price_text(raw):
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount) or amount <= 0:
+        return None
+    if amount.is_integer():
+        return str(int(amount))
+    return f"{amount:.6f}".rstrip("0").rstrip(".")
+
+
+def product_buy_buttons(user, product):
+    """Return (button_rows, note). Buy opens a pre-filled WhatsApp chat; it
+    does NOT create an order or confirm payment."""
+    count = stock_value(product)
+    if count is None:
+        return [], "Availability unknown - please contact support."
+    if count <= 0:
+        return [], "Out of stock - purchase is unavailable."
+
+    name = str(product.get("name") or "Product")
+    username = getattr(user, "username", None)
+    telegram_id = getattr(user, "id", None)
+    options = []
+    for key, currency in (("price_inr", "INR"), ("price_usdt", "USDT")):
+        shown = _price_text(product.get(key))
+        if shown:
+            options.append((currency, shown))
+    if not options:
+        options = [(None, None)]
+
+    buttons = []
+    for currency, shown in options:
+        try:
+            link = build_whatsapp_link(
+                WHATSAPP_NUMBER, product=name, price=shown, currency=currency,
+                username=username, telegram_id=telegram_id,
+            )
+        except ValueError:
+            continue
+        if is_valid_whatsapp_url(link):
+            label = f"\U0001F6D2 Buy - {shown} {currency}" if shown else "\U0001F6D2 Buy on WhatsApp"
+            buttons.append([InlineKeyboardButton(label, url=link)])
+    if not buttons:
+        return [], "Purchase link unavailable - please contact support."
+    return buttons, "Tap Buy to continue on WhatsApp. Orders are confirmed there."
+
+
+# Callback references: stateless, restart-safe, <= 33 chars (callback_data limit is 64 bytes).
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+_NUM_REF_RE = re.compile(r"^\d{1,18}$")
+_HEX_REF_RE = re.compile(r"^u([0-9a-f]{32})$")
+
+
+def encode_ref(value):
+    if value is None or isinstance(value, bool):
+        return ""
+    text = str(value).strip()
+    if _NUM_REF_RE.fullmatch(text):
+        return text
+    if _UUID_RE.fullmatch(text):
+        return "u" + text.replace("-", "").lower()
+    return ""
+
+
+def decode_ref(ref):
+    if not isinstance(ref, str):
+        return None
+    text = ref.strip()
+    if _NUM_REF_RE.fullmatch(text):
+        return text
+    match = _HEX_REF_RE.fullmatch(text)
+    if match:
+        h = match.group(1)
+        return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+    if _UUID_RE.fullmatch(text):
+        return text.lower()
+    return None
+
+
+# Product edit fields (codes match the buttons built in admin_product_edit_).
+PRODUCT_FIELD_KEYS = {
+    "name": "n", "description": "d", "price_inr": "i", "price_usdt": "u",
+    "stock": "s", "is_active": "a", "warranty": "w",
+}
+PRODUCT_FIELD_CODES = {code: field for field, code in PRODUCT_FIELD_KEYS.items()}
+PRODUCT_EDIT_FIELDS = tuple(PRODUCT_FIELD_KEYS)
+
+# Order status workflow. UNVERIFIED: the exact status strings your table accepts.
+ORDER_STATUSES = {"P": "PENDING", "A": "PAID", "X": "CANCELLED"}
+_STATUS_GROUP = {
+    "PENDING": "P", "PAYMENT_PENDING": "P",
+    "PAID": "A", "COMPLETED": "A", "SUCCESS": "A",
+    "CANCELLED": "X", "CANCELED": "X",
+}
+MAX_PENDING_CONFIRMATIONS = 20
+PENDING_CONFIRM_TTL = 600  # seconds
+_TOKEN_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def parse_order_status_callback(action):
+    match = re.fullmatch(r"admin_os_([A-Za-z0-9]{1,40})_([PAX])", action or "")
+    if not match:
+        return None
+    order_id = decode_ref(match.group(1))
+    if order_id is None:
+        return None
+    return order_id, ORDER_STATUSES[match.group(2)]
+
+
+def status_match_filter(old_status):
+    """PostgREST filter that matches the status we read (guards against races)."""
+    return "is.null" if old_status is None else f"eq.{old_status}"
+
+
+def check_transition(old_status, new_status):
+    """Return (allowed, reason). The reason is shown to the admin."""
+    new_key = str(new_status or "").upper()
+    if new_key not in _STATUS_GROUP:
+        return False, "Unknown target status."
+    old_key = str(old_status).strip().upper() if old_status is not None else ""
+    if old_key == new_key or (old_key and _STATUS_GROUP.get(old_key) == _STATUS_GROUP[new_key]):
+        return False, f"Order is already {old_status}."
+    if not old_key:
+        return True, "Current status is empty; it will be set to the new status."
+    if old_key not in _STATUS_GROUP:
+        return True, f"Warning: current status '{old_status}' is not a standard status."
+    if new_key == "PAID":
+        return True, ("Mark as PAID only after YOU have verified the payment. "
+                      "The bot does not verify payments.")
+    if _STATUS_GROUP[old_key] == "X":
+        return True, "Warning: this order was cancelled and will be reopened."
+    if _STATUS_GROUP[old_key] == "A":
+        return True, ("Warning: this order was marked paid. Change it only if the "
+                      "payment was reversed or the paid mark was a mistake.")
+    return True, "Status will be changed."
+
+
+def _prune_pending(store, now):
+    for token in [t for t, v in store.items() if now - v.get("ts", 0) > PENDING_CONFIRM_TTL]:
+        del store[token]
+
+
+def store_pending_status(context, order_id, old_status, new_status):
+    store = context.user_data.setdefault("pending_status", {})
+    now = time.time()
+    _prune_pending(store, now)
+    while len(store) >= MAX_PENDING_CONFIRMATIONS:
+        del store[min(store, key=lambda t: store[t].get("ts", 0))]
+    token = secrets.token_hex(4)
+    while token in store:
+        token = secrets.token_hex(4)
+    store[token] = {"order_id": order_id, "old_status": old_status,
+                    "new_status": new_status, "ts": now}
+    return token
+
+
+def get_pending_status(context, token, consume=False):
+    if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+        return None
+    store = context.user_data.get("pending_status") or {}
+    _prune_pending(store, time.time())
+    entry = store.pop(token, None) if consume else store.get(token)
+    return dict(entry) if entry else None
+
+
+def _require_rows(result):
+    """Admin writes only count as success if the database returned a row."""
+    if not result:
+        raise RuntimeError("Database reported no matching row; nothing was changed.")
+    return result
+
+
+def _get_with_fallback(table, params, fallback_select, optional=False):
+    """GET with a narrower column list if the full select is rejected."""
+    try:
+        return supabase_get(table, params)
+    except requests.HTTPError:
+        logger.warning("Query on %s rejected; retrying with fewer columns", table)
+        try:
+            return supabase_get(table, {**params, "select": fallback_select})
+        except requests.HTTPError:
+            if optional:
+                logger.warning("Table %s is unavailable; continuing without it", table)
+                return []
+            raise
+
+
 # Admin access
 ADMIN_IDS = {8672422283, 6892918791}
 ADMIN_ID = next(iter(ADMIN_IDS))
@@ -53,9 +339,9 @@ def admin_menu():
         [InlineKeyboardButton("\U0001F4CA Statistics", callback_data="admin_stats")],
         [InlineKeyboardButton("📦 Products", callback_data="admin_products"),
          InlineKeyboardButton("🎁 Offers", callback_data="admin_offers")],
-        [InlineKeyboardButton("?? Orders", callback_data="admin_orders")],
-        [InlineKeyboardButton("?? Customers", callback_data="admin_customers"),
-         InlineKeyboardButton("?? Support Tickets", callback_data="admin_support")],
+        [InlineKeyboardButton("📋 Orders", callback_data="admin_orders")],
+        [InlineKeyboardButton("👥 Customers", callback_data="admin_customers"),
+         InlineKeyboardButton("🎫 Support Tickets", callback_data="admin_support")],
     ])
 
 
@@ -63,7 +349,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
         await update.effective_message.reply_text(
-            "? Access Denied!\n\n"
+            "⛔ Access Denied!\n\n"
             "You are not an admin. Only authorized administrators "
             "can access the BN Tech Admin Panel."
         )
@@ -176,12 +462,14 @@ def main_menu(lang="en"):
         ],
         [InlineKeyboardButton(t["language"], callback_data="language")],
         [
+            InlineKeyboardButton(t["whatsapp"], url=WHATSAPP_URL),
             InlineKeyboardButton(t["telegram"], url=TELEGRAM_SUPPORT),
         ],
     ])
 
 CHANNEL_USERNAME = "-1004372417917"
 CHANNEL_URL = "https://t.me/bntechdigital02"
+CHANNEL_CHAT_ID = int(CHANNEL_USERNAME) if CHANNEL_USERNAME.lstrip("-").isdigit() else CHANNEL_USERNAME
 
 
 def channel_gate_keyboard():
@@ -195,7 +483,7 @@ def channel_gate_keyboard():
 async def check_channel_membership(context, user_id):
     try:
         member = await context.bot.get_chat_member(
-            chat_id=CHANNEL_USERNAME,
+            chat_id=CHANNEL_CHAT_ID,
             user_id=user_id,
         )
         if member.status in ("member", "administrator", "creator"):
@@ -208,13 +496,21 @@ async def check_channel_membership(context, user_id):
         return None
 
 
-async def show_channel_gate(message):
-    await message.reply_text(
-        "?? Please join our Telegram channel before using this bot.\n\n"
-        "1. Click Join Channel.\n"
-        "2. After joining, click Verify Membership.",
-        reply_markup=channel_gate_keyboard(),
-    )
+async def show_channel_gate(message, check_failed=False):
+    if check_failed:
+        text = (
+            "\u26A0\uFE0F We could not verify your channel membership right now.\n\n"
+            "This is a temporary check problem, not necessarily a missing membership. "
+            "Please tap Verify Membership to try again in a moment. "
+            "If it keeps failing, contact support."
+        )
+    else:
+        text = (
+            "\U0001F4E2 Please join our Telegram channel before using this bot.\n\n"
+            "1. Click Join Channel.\n"
+            "2. After joining, click Verify Membership."
+        )
+    await message.reply_text(text, reply_markup=channel_gate_keyboard())
 
 async def register_broadcast_subscriber(user):
     """Register a user who has started the bot for future broadcasts."""
@@ -256,11 +552,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await register_broadcast_subscriber(user)
     logger.info("Subscriber registration function completed for user ID %s", user.id)
 
-    # Require channel membership before showing the main menu.
-    membership = await check_channel_membership(context, user.id)
-    if membership is not True:
-        await show_channel_gate(update.effective_message)
-        return
+    # Require channel membership (admins bypass, matching the Verify button).
+    if not is_admin(user.id):
+        membership = await check_channel_membership(context, user.id)
+        if membership is not True:
+            await show_channel_gate(update.effective_message, check_failed=(membership is None))
+            return
 
     lang = user_language(context)
     t = LANGUAGES[lang]
@@ -423,7 +720,7 @@ async def show_products(query):
             f"\U0001F4E6 {name}\n{description}\n"
             f"\U0001F4B0 Price: {product.get('price_inr', 'Contact us')}\n"
             f"\U0001F30D International price: {product.get('price_usdt', 'Contact us')} USDT\n"
-            f"Stock: {product.get('stock', 'Contact us')}"
+            f"{stock_label(product)}"
         )
         buttons, note = product_buy_buttons(user, product)
         if note:
@@ -481,8 +778,8 @@ async def show_offers(query):
             link = build_whatsapp_link(
                 WHATSAPP_NUMBER,
                 product="Offer",
-                price=1,
-                currency="INR",
+                price=None,
+                currency=None,
                 username=getattr(user, "username", None),
                 telegram_id=getattr(user, "id", None),
                 offer=title + (f" ({discount})" if discount else ""),
@@ -529,7 +826,7 @@ def _build_order_invoice(order, product):
     )
     styles = getSampleStyleSheet()
     story = [
-        Paragraph("BN TECH ? ORDER INVOICE", styles["Title"]),
+        Paragraph("BN TECH - ORDER INVOICE", styles["Title"]),
         Spacer(1, 8 * mm),
         Paragraph(f"Order ID: {_invoice_text(order.get('id'))}", styles["Normal"]),
         Paragraph(f"Order date: {_invoice_text(order.get('created_at'))}", styles["Normal"]),
@@ -649,11 +946,12 @@ async def show_orders(query, context=None):
             f'{tr(context, "status")}: {order.get("status", "N/A")}\n'
             f'{tr(context, "date")}: {order.get("created_at") or "N/A"}\n'
         )
-        if order_id is not None:
+        order_ref = encode_ref(order_id)
+        if order_ref:
             invoice_buttons.append([
                 InlineKeyboardButton(
                     f"Download Invoice #{order_id}",
-                    callback_data=f"invoice_{encode_ref(order_id)}",
+                    callback_data=f"invoice_{order_ref}",
                 )
             ])
     await query.message.reply_text(
@@ -684,6 +982,13 @@ def supabase_mutate(method, table, payload=None, params=None):
     """Perform a Supabase REST mutation using the service-role key."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase is not configured")
+    method = str(method).upper()
+    if method in ("PATCH", "DELETE") and not params:
+        raise ValueError("Refusing PATCH/DELETE without a row filter")
+    prefer = "return=representation"
+    if method == "POST" and params and "on_conflict" in params:
+        # Upsert: without this header a returning user hits a duplicate-key error.
+        prefer = "resolution=merge-duplicates," + prefer
     response = requests.request(
         method,
         f"{SUPABASE_URL}/rest/v1/{table}",
@@ -691,7 +996,7 @@ def supabase_mutate(method, table, payload=None, params=None):
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
-            "Prefer": "return=representation",
+            "Prefer": prefer,
         },
         json=payload,
         params=params,
@@ -804,12 +1109,12 @@ def admin_products_keyboard(rows):
     buttons = [[InlineKeyboardButton("\u2795 Add product", callback_data="admin_product_add")]]
     for p in rows[:15]:
         pid = p.get("id")
-        status = "??" if p.get("is_active", True) else "??"
+        status = "🟢" if p.get("is_active", True) else "🔴"
         buttons.append([InlineKeyboardButton(
             f"{status} {str(p.get('name') or 'Product')[:35]} (ID {pid})",
             callback_data=f"admin_product_view_{encode_ref(pid)}",
         )])
-    buttons.append([InlineKeyboardButton("🎁ï¸ Admin menu", callback_data="admin_home")])
+    buttons.append([InlineKeyboardButton("🏠 Admin menu", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -817,12 +1122,12 @@ def admin_offers_keyboard(rows):
     buttons = [[InlineKeyboardButton("\u2795 Add offer", callback_data="admin_offer_add")]]
     for o in rows[:15]:
         oid = o.get("id")
-        status = "??" if o.get("is_active", True) else "??"
+        status = "🟢" if o.get("is_active", True) else "🔴"
         buttons.append([InlineKeyboardButton(
             f"{status} {str(o.get('title') or 'Offer')[:35]} (ID {oid})",
             callback_data=f"admin_offer_view_{encode_ref(oid)}",
         )])
-    buttons.append([InlineKeyboardButton("🎁ï¸ Admin menu", callback_data="admin_home")])
+    buttons.append([InlineKeyboardButton("🏠 Admin menu", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -831,7 +1136,7 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     if not query.from_user or not is_admin(query.from_user.id):
         await query.message.reply_text(
-            "? Access Denied! You are not an admin."
+            "⛔ Access Denied! You are not an admin."
         )
         return
 
@@ -855,10 +1160,10 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             paid = sum(str(o.get("status", "")).upper() in ("PAID", "COMPLETED", "SUCCESS") for o in orders)
             revenue = sum(float(o.get("total_inr") or 0) for o in orders if str(o.get("status", "")).upper() in ("PAID", "COMPLETED", "SUCCESS"))
             await query.message.reply_text(
-                "?? BN TECH STATISTICS\n\n"
+                "📊 BN TECH STATISTICS\n\n"
                 f"📦 Products: {len(products)}\n🎁 Active offers: {len(offers)}\n"
-                f"?? Orders: {len(orders)}\n? Pending orders: {pending}\n"
-                f"? Paid/completed orders: {paid}\n💰 Recorded paid revenue: {revenue:.2f}",
+                f"📋 Orders: {len(orders)}\n⏳ Pending orders: {pending}\n"
+                f"✅ Paid/completed orders: {paid}\n💰 Recorded paid revenue: {revenue:.2f}",
                 reply_markup=admin_menu(),
             )
 
@@ -894,10 +1199,10 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"Stock: {p.get('stock')} | Active: {active}\n"
                 f"Warranty: {p.get('warranty') or 'Not set'}",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("?? Edit", callback_data=f"admin_product_edit_{encode_ref(pid)}")],
-                    [InlineKeyboardButton("?? Activate/Deactivate", callback_data=f"admin_product_toggle_{encode_ref(pid)}")],
-                    [InlineKeyboardButton("??? Delete", callback_data=f"admin_product_delete_{encode_ref(pid)}")],
-                    [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")],
+                    [InlineKeyboardButton("✏️ Edit", callback_data=f"admin_product_edit_{encode_ref(pid)}")],
+                    [InlineKeyboardButton("🔄 Activate/Deactivate", callback_data=f"admin_product_toggle_{encode_ref(pid)}")],
+                    [InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_product_delete_{encode_ref(pid)}")],
+                    [InlineKeyboardButton("📦 Products", callback_data="admin_products")],
                 ]),
             )
 
@@ -908,7 +1213,7 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 "data": {},
             }
             await query.message.reply_text(
-                "ADD PRODUCT ? Step 1 of 6\n\n"
+                "ADD PRODUCT - Step 1 of 6\n\n"
                 "Enter the product name.\n"
                 "Send /cancel anytime to cancel."
             )
@@ -941,9 +1246,9 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 "price_usdt": "Send the new USDT price (examples: 1, USDT 1, $1):",
                 "stock": "Send the new stock quantity (whole number, 0 or higher):",
                 "is_active": "Send true to activate or false to deactivate this product:",
-                            "warranty": "Send warranty details (up to 500 characters; blank clears it):",
+                            "warranty": "Send warranty details (up to 500 characters), or /skip to clear it:",
             }
-            await query.message.reply_text(f"?? Editing product ID {pid}\n{prompts[field]}\nSend /cancel to cancel.")
+            await query.message.reply_text(f"✏️ Editing product ID {pid}\n{prompts[field]}\nSend /cancel to cancel.")
 
         elif action.startswith("admin_product_edit_"):
             pid = decode_ref(action[len("admin_product_edit_"):])
@@ -953,14 +1258,14 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.message.reply_text(
                 f"Choose which field to edit for product ID {pid}:",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("?? Name", callback_data=f"admin_product_editfield_{encode_ref(pid)}_n"),
-                     InlineKeyboardButton("?? Description", callback_data=f"admin_product_editfield_{encode_ref(pid)}_d")],
-                    [InlineKeyboardButton("???? INR price", callback_data=f"admin_product_editfield_{encode_ref(pid)}_i"),
-                     InlineKeyboardButton("?? USDT price", callback_data=f"admin_product_editfield_{encode_ref(pid)}_u")],
+                    [InlineKeyboardButton("📝 Name", callback_data=f"admin_product_editfield_{encode_ref(pid)}_n"),
+                     InlineKeyboardButton("📄 Description", callback_data=f"admin_product_editfield_{encode_ref(pid)}_d")],
+                    [InlineKeyboardButton("🇮🇳 INR price", callback_data=f"admin_product_editfield_{encode_ref(pid)}_i"),
+                     InlineKeyboardButton("💵 USDT price", callback_data=f"admin_product_editfield_{encode_ref(pid)}_u")],
                     [InlineKeyboardButton("📦 Stock", callback_data=f"admin_product_editfield_{encode_ref(pid)}_s"),
-                     InlineKeyboardButton("?? Active status", callback_data=f"admin_product_editfield_{encode_ref(pid)}_a")],
+                     InlineKeyboardButton("🔄 Active status", callback_data=f"admin_product_editfield_{encode_ref(pid)}_a")],
                      [InlineKeyboardButton("Warranty", callback_data=f"admin_product_editfield_{encode_ref(pid)}_w")],
-                    [InlineKeyboardButton("🎁ï¸ Back to product", callback_data=f"admin_product_view_{encode_ref(pid)}")],
+                    [InlineKeyboardButton("⬅️ Back to product", callback_data=f"admin_product_view_{encode_ref(pid)}")],
                 ])
             )
 
@@ -975,28 +1280,31 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if not rows:
                 raise RuntimeError("Product not found")
             new_active = not bool(rows[0].get("is_active", True))
-            await asyncio.to_thread(admin_mutate, query.from_user.id, "PATCH", "bntech_products",
-                                    {"is_active": new_active}, {"id": f"eq.{pid}"})
+            _require_rows(await asyncio.to_thread(admin_mutate, query.from_user.id, "PATCH", "bntech_products",
+                                                  {"is_active": new_active}, {"id": f"eq.{pid}"}))
             await query.message.reply_text(f"Product {pid} active set to {new_active}.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
             ]))
 
         elif action.startswith("admin_product_delete_") and not action.startswith("admin_product_delete_confirm_"):
-            pid = action.rsplit("_", 1)[1]
+            pid = decode_ref(action.rsplit("_", 1)[1])
+            if pid is None:
+                await query.message.reply_text("Invalid or expired product reference.")
+                return
             try:
                 product = await asyncio.to_thread(check_product_deletion_safety, pid)
             except ValueError as exc:
-                buttons = [[InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]]
+                buttons = [[InlineKeyboardButton("📦 Products", callback_data="admin_products")]]
                 if "linked to existing orders" in str(exc).lower():
-                    buttons.insert(0, [InlineKeyboardButton("?? Toggle product status", callback_data=f"admin_product_toggle_{encode_ref(pid)}")])
+                    buttons.insert(0, [InlineKeyboardButton("🔄 Toggle product status", callback_data=f"admin_product_toggle_{encode_ref(pid)}")])
                 await query.message.reply_text(str(exc), reply_markup=InlineKeyboardMarkup(buttons))
                 return
             except Exception:
                 logger.exception("Could not verify product deletion safety")
                 await query.message.reply_text(
-                    "?? Could not verify stock/orders. Product was NOT deleted.",
+                    "⚠️ Could not verify stock/orders. Product was NOT deleted.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                        [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
                     ]),
                 )
                 return
@@ -1005,7 +1313,7 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"Delete product {product.get('name', pid)} (ID {pid})? This cannot be undone. "
                 "Stock and linked orders will be checked again after confirmation.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("?? Confirm delete", callback_data=f"admin_product_delete_confirm_{pid}"),
+                    InlineKeyboardButton("🗑️ Confirm delete", callback_data=f"admin_product_delete_confirm_{encode_ref(pid)}"),
                     InlineKeyboardButton("Cancel", callback_data=f"admin_product_view_{encode_ref(pid)}")
                 ]]),
             )
@@ -1022,35 +1330,35 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 if not deleted:
                     await query.message.reply_text(
-                        "?? No product was deleted. It may have changed or already been removed.",
+                        "⚠️ No product was deleted. It may have changed or already been removed.",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                            [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
                         ]),
                     )
                     return
             except ValueError as exc:
                 await query.message.reply_text(str(exc), reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                    [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
                 ]))
                 return
             except requests.HTTPError as exc:
                 status_code = exc.response.status_code if exc.response is not None else None
                 logger.exception("Product deletion rejected by database")
                 message = (
-                    "?? The database refused the delete. Product was not deleted."
+                    "⚠️ The database refused the delete. Product was not deleted."
                     if status_code == 409
-                    else "?? Database error. Product was not reported as deleted."
+                    else "⚠️ Database error. Product was not reported as deleted."
                 )
                 await query.message.reply_text(message, reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                    [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
                 ]))
                 return
             except Exception:
                 logger.exception("Could not safely delete product")
                 await query.message.reply_text(
-                    "?? Database request failed. Product was NOT deleted.",
+                    "⚠️ Database request failed. Product was NOT deleted.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                        [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
                     ]),
                 )
                 return
@@ -1058,7 +1366,7 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.message.reply_text(
                 f"Product ID {pid} deleted.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁ï¸ Products", callback_data="admin_products")]
+                    [InlineKeyboardButton("📦 Products", callback_data="admin_products")]
                 ]),
             )
 
@@ -1075,7 +1383,10 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif action.startswith("admin_offer_view_"):
-            oid = action.rsplit("_", 1)[1]
+            oid = decode_ref(action.rsplit("_", 1)[1])
+            if oid is None:
+                await query.message.reply_text("Invalid or expired offer reference.")
+                return
             rows = await asyncio.to_thread(supabase_get, "bntech_offers", {
                 "select": "id,title,description,discount_text,is_active,starts_at,ends_at",
                 "id": f"eq.{oid}", "limit": "1"
@@ -1088,10 +1399,10 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"🎁 {o.get('title')} (ID {oid})\n{ o.get('description') or '' }\n"
                 f"Discount: {o.get('discount_text') or '-'}\nActive: {o.get('is_active')}",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("?? Edit", callback_data=f"admin_offer_edit_{oid}")],
-                    [InlineKeyboardButton("?? Activate/Deactivate", callback_data=f"admin_offer_toggle_{oid}")],
-                    [InlineKeyboardButton("??? Delete", callback_data=f"admin_offer_delete_{oid}")],
-                    [InlineKeyboardButton("🎁ï¸ Offers", callback_data="admin_offers")],
+                    [InlineKeyboardButton("✏️ Edit", callback_data=f"admin_offer_edit_{encode_ref(oid)}")],
+                    [InlineKeyboardButton("🔄 Activate/Deactivate", callback_data=f"admin_offer_toggle_{encode_ref(oid)}")],
+                    [InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_offer_delete_{encode_ref(oid)}")],
+                    [InlineKeyboardButton("🎁 Offers", callback_data="admin_offers")],
                 ]),
             )
 
@@ -1104,7 +1415,10 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif action.startswith("admin_offer_edit_"):
-            oid = action.rsplit("_", 1)[1]
+            oid = decode_ref(action.rsplit("_", 1)[1])
+            if oid is None:
+                await query.message.reply_text("Invalid or expired offer reference.")
+                return
             context.user_data["admin_input"] = {"kind": "offer_edit", "id": oid}
             await query.message.reply_text(
                 f"Send field to change for offer ID {oid}: title=value OR description=value OR discount_text=value OR is_active=true/false\n"
@@ -1112,50 +1426,60 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         elif action.startswith("admin_offer_toggle_"):
-            oid = action.rsplit("_", 1)[1]
+            oid = decode_ref(action.rsplit("_", 1)[1])
+            if oid is None:
+                await query.message.reply_text("Invalid or expired offer reference.")
+                return
             rows = await asyncio.to_thread(supabase_get, "bntech_offers", {
                 "select": "is_active", "id": f"eq.{oid}", "limit": "1"
             })
             if not rows:
                 raise RuntimeError("Offer not found")
             new_active = not bool(rows[0].get("is_active", True))
-            await asyncio.to_thread(admin_mutate, query.from_user.id, "PATCH", "bntech_offers",
-                                    {"is_active": new_active}, {"id": f"eq.{oid}"})
+            _require_rows(await asyncio.to_thread(admin_mutate, query.from_user.id, "PATCH", "bntech_offers",
+                                                  {"is_active": new_active}, {"id": f"eq.{oid}"}))
             await query.message.reply_text(f"Offer {oid} active set to {new_active}.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁ï¸ Offers", callback_data="admin_offers")]
+                [InlineKeyboardButton("🎁 Offers", callback_data="admin_offers")]
             ]))
 
         elif action.startswith("admin_offer_delete_") and not action.startswith("admin_offer_delete_confirm_"):
-            oid = action.rsplit("_", 1)[1]
+            oid = decode_ref(action.rsplit("_", 1)[1])
+            if oid is None:
+                await query.message.reply_text("Invalid or expired offer reference.")
+                return
             await query.message.reply_text(
                 f"Delete offer ID {oid}? This cannot be undone.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("?? Confirm delete", callback_data=f"admin_offer_delete_confirm_{oid}"),
+                    InlineKeyboardButton("🗑️ Confirm delete", callback_data=f"admin_offer_delete_confirm_{encode_ref(oid)}"),
                     InlineKeyboardButton("Cancel", callback_data=f"admin_offer_view_{encode_ref(oid)}")
                 ]]),
             )
 
         elif action.startswith("admin_offer_delete_confirm_"):
-            oid = action.rsplit("_", 1)[1]
-            await asyncio.to_thread(admin_mutate, query.from_user.id, "DELETE", "bntech_offers", None, {"id": f"eq.{oid}"})
+            oid = decode_ref(action.rsplit("_", 1)[1])
+            if oid is None:
+                await query.message.reply_text("Invalid or expired offer reference.")
+                return
+            _require_rows(await asyncio.to_thread(admin_mutate, query.from_user.id, "DELETE", "bntech_offers", None, {"id": f"eq.{oid}"}))
             await query.message.reply_text(f"Offer ID {oid} deleted.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁ï¸ Offers", callback_data="admin_offers")]
+                [InlineKeyboardButton("🎁 Offers", callback_data="admin_offers")]
             ]))
 
         elif action == "admin_customers":
             orders, tickets = await asyncio.gather(
-                asyncio.to_thread(supabase_get, "bntech_orders", {
+                asyncio.to_thread(_get_with_fallback, "bntech_orders", {
                     "select": "telegram_user_id,username,created_at",
                     "order": "created_at.desc", "limit": "1000"
-                }),
-                asyncio.to_thread(supabase_get, "bntech_support_tickets", {
+                }, "telegram_user_id,created_at"),
+                asyncio.to_thread(_get_with_fallback, "bntech_support_tickets", {
                     "select": "telegram_user_id,username,first_name,created_at",
                     "order": "created_at.desc", "limit": "1000"
-                }),
+                }, "telegram_user_id,created_at", True),
             )
 
-            if orders is None or tickets is None:
+            if orders is None:
                 raise RuntimeError("Could not load customer records from Supabase")
+            tickets = tickets or []
 
             customers = {}
 
@@ -1221,10 +1545,10 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if rows is None:
                 raise RuntimeError("Supabase setup missing")
             if not rows:
-                await query.message.reply_text("?? No support tickets found.", reply_markup=admin_menu())
+                await query.message.reply_text("🎫 No support tickets found.", reply_markup=admin_menu())
             else:
                 # Display ticket fields dynamically because the project's ticket schema can vary.
-                lines = ["?? RECENT SUPPORT TICKETS"]
+                lines = ["🎫 RECENT SUPPORT TICKETS"]
                 for ticket in rows[:10]:
                     safe_fields = []
                     for key, value in ticket.items():
@@ -1255,19 +1579,19 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     oid = encode_ref(o.get("id"))
                     buttons = [
                         [InlineKeyboardButton("Download / Resend Invoice", callback_data=f"admin_inv_{oid}")],
-                        [InlineKeyboardButton("? Pending", callback_data=f"admin_os_{oid}_P"),
-                         InlineKeyboardButton("? Paid", callback_data=f"admin_os_{oid}_A")],
-                        [InlineKeyboardButton("? Cancel", callback_data=f"admin_os_{oid}_X")],
+                        [InlineKeyboardButton("⏳ Pending", callback_data=f"admin_os_{oid}_P"),
+                         InlineKeyboardButton("✅ Paid", callback_data=f"admin_os_{oid}_A")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"admin_os_{oid}_X")],
                     ]
                     await query.message.reply_text(
-                        f"?? Order #{o.get('id')}\\nCustomer: {o.get('telegram_user_id')}\\n"
-                        f"Product ID: {o.get('product_id')} | Qty: {o.get('quantity')}\\n"
-                        f"Total: {o.get('total_inr')}\\nStatus: {o.get('status')}\\n"
-                        f"Date: {o.get('created_at') or 'N/A'}\\n"
+                        f"📋 Order #{o.get('id')}\nCustomer: {o.get('telegram_user_id')}\n"
+                        f"Product ID: {o.get('product_id')} | Qty: {o.get('quantity')}\n"
+                        f"Total: {o.get('total_inr')}\nStatus: {o.get('status')}\n"
+                        f"Date: {o.get('created_at') or 'N/A'}\n"
                         "Status buttons are requests, not proof of payment.",
                         reply_markup=InlineKeyboardMarkup(buttons),
                     )
-                await query.message.reply_text("?? Admin menu", reply_markup=admin_menu())
+                await query.message.reply_text("🏠 Admin menu", reply_markup=admin_menu())
 
         elif action.startswith("admin_os_"):
             parsed = parse_order_status_callback(action)
@@ -1295,9 +1619,9 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await query.message.reply_text("Could not create confirmation. Please try again.")
                 return
             confirm_text = (
-                f"Confirm order #{order_id} status change?\\n"
-                f"Current: {old_status or 'NULL'}\\nNew: {new_status}\\n"
-                f"{reason}\\n\\nNo customer notification will be sent."
+                f"Confirm order #{order_id} status change?\n"
+                f"Current: {old_status or 'NULL'}\nNew: {new_status}\n"
+                f"{reason}\n\nNo customer notification will be sent."
             )
             await query.message.reply_text(
                 confirm_text,
@@ -1333,14 +1657,14 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 current_ref = encode_ref(current.get("id"))
                 await query.message.reply_text(
-                    f"Order #{order_id}\\nStatus: {current.get('status')}\\n"
-                    f"Total: {current.get('total_inr')}\\n"
+                    f"Order #{order_id}\nStatus: {current.get('status')}\n"
+                    f"Total: {current.get('total_inr')}\n"
                     "Status buttons are requests, not proof of payment.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("? Pending", callback_data=f"admin_os_{current_ref}_P"),
-                         InlineKeyboardButton("? Paid", callback_data=f"admin_os_{current_ref}_A")],
-                        [InlineKeyboardButton("? Cancel", callback_data=f"admin_os_{current_ref}_X")],
-                        [InlineKeyboardButton("🎁ï¸ Orders", callback_data="admin_orders")],
+                        [InlineKeyboardButton("⏳ Pending", callback_data=f"admin_os_{current_ref}_P"),
+                         InlineKeyboardButton("✅ Paid", callback_data=f"admin_os_{current_ref}_A")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"admin_os_{current_ref}_X")],
+                        [InlineKeyboardButton("📋 Orders", callback_data="admin_orders")],
                     ]),
                 )
                 return
@@ -1356,21 +1680,40 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.message.reply_text(
                 f"Order #{order_id} status updated to {new_status}. Customer has not been notified.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🎁ï¸ Orders", callback_data="admin_orders")
+                    InlineKeyboardButton("📋 Orders", callback_data="admin_orders")
                 ]]),
             )
 
     except requests.RequestException as exc:
         logger.exception("Admin database request failed")
         await query.message.reply_text(
-            "?? Database request failed. Check Supabase permissions/schema and try again."
+            "⚠️ Database request failed. Check Supabase permissions/schema and try again."
         )
     except Exception:
         logger.exception("Admin action failed: %s", action)
-        await query.message.reply_text("?? Admin action failed. Check CMD logs for details.")
+        await query.message.reply_text("⚠️ Admin action failed. Check CMD logs for details.")
 
 
 async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _handle_admin_text(update, context, (update.effective_message.text or "").strip())
+
+
+async def admin_skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/skip is a command, so the plain-text handler never sees it."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.effective_message.reply_text("\u26D4 Access Denied! You are not an admin.")
+        return
+    state = context.user_data.get("admin_input") or {}
+    if state.get("kind") == "product_add" and state.get("step") == "warranty":
+        await _handle_admin_text(update, context, "/skip")
+    elif state.get("kind") == "product_edit" and state.get("field") == "warranty":
+        await _handle_admin_text(update, context, "")  # clears the warranty
+    else:
+        await update.effective_message.reply_text("Nothing to skip right now.")
+
+
+async def _handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text):
     user = update.effective_user
 
     if not user or not is_admin(user.id):
@@ -1378,7 +1721,6 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state = context.user_data.get("admin_input")
     if not state:
         return
-    text = (update.effective_message.text or "").strip()
     if text.lower() == "/cancel":
         context.user_data.pop("admin_input", None)
         await update.effective_message.reply_text("Cancelled.", reply_markup=admin_menu())
@@ -1398,7 +1740,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 data["name"] = text
                 state["step"] = "description"
                 await update.effective_message.reply_text(
-                    "Step 2 of 6 ? Description\n\nEnter the product description."
+                    "Step 2 of 6 - Description\n\nEnter the product description."
                 )
 
             elif step == "description":
@@ -1407,7 +1749,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 data["description"] = text
                 state["step"] = "price_inr"
                 await update.effective_message.reply_text(
-                    "Step 3 of 6 ? INR price\n\nEnter the price in INR, for example: 199"
+                    "Step 3 of 6 - INR price\n\nEnter the price in INR, for example: 199"
                 )
 
             elif step == "price_inr":
@@ -1417,7 +1759,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 data["price_inr"] = amount
                 state["step"] = "price_usdt"
                 await update.effective_message.reply_text(
-                    "Step 4 of 6 ? USDT price\n\nEnter the price in USDT, for example: 2.5"
+                    "Step 4 of 6 - USDT price\n\nEnter the price in USDT, for example: 2.5"
                 )
 
             elif step == "price_usdt":
@@ -1427,7 +1769,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 data["price_usdt"] = amount
                 state["step"] = "stock"
                 await update.effective_message.reply_text(
-                    "Step 5 of 6 ? Stock quantity\n\nEnter a whole number, for example: 10"
+                    "Step 5 of 6 - Stock quantity\n\nEnter a whole number, for example: 10"
                 )
 
             elif step == "stock":
@@ -1440,7 +1782,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 data["stock"] = stock
                 state["step"] = "warranty"
                 await update.effective_message.reply_text(
-                    "Step 6 of 6 ? Warranty\n\n"
+                    "Step 6 of 6 - Warranty\n\n"
                     "Enter warranty text, e.g. 3 months or lifetime.\n"
                     "Send /skip if there is no warranty."
                 )
@@ -1475,9 +1817,9 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     "warranty": data.get("warranty", ""),
                     "is_active": True,
                 }
-                await asyncio.to_thread(
+                _require_rows(await asyncio.to_thread(
                     admin_mutate, user.id, "POST", "bntech_products", payload
-                )
+                ))
                 context.user_data.pop("admin_input", None)
                 await update.effective_message.reply_text(
                     "Product added successfully.", reply_markup=admin_menu()
@@ -1540,14 +1882,14 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             elif field == "is_active":
                 if value.lower() not in {"true", "false"}: raise ValueError("Use true or false")
                 value = value.lower() == "true"
-            await asyncio.to_thread(admin_mutate, user.id, "PATCH", "bntech_products",
-                                    {field: value}, {"id": f"eq.{state['id']}"})
+            _require_rows(await asyncio.to_thread(admin_mutate, user.id, "PATCH", "bntech_products",
+                                                  {field: value}, {"id": f"eq.{state['id']}"}))
             context.user_data.pop("admin_input", None)
             await update.effective_message.reply_text(
-                f"? Product ID {state['id']} updated successfully.",
+                f"✅ Product ID {state['id']} updated successfully.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📦 View products", callback_data="admin_products")],
-                    [InlineKeyboardButton("?? Admin menu", callback_data="admin_home")],
+                    [InlineKeyboardButton("🏠 Admin menu", callback_data="admin_home")],
                 ])
             )
 
@@ -1562,9 +1904,9 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 raise ValueError("Offer discount text must be 100 characters or fewer")
             payload = {"title": title, "description": description,
                        "discount_text": discount_text, "is_active": True}
-            await asyncio.to_thread(admin_mutate, user.id, "POST", "bntech_offers", payload)
+            _require_rows(await asyncio.to_thread(admin_mutate, user.id, "POST", "bntech_offers", payload))
             context.user_data.pop("admin_input", None)
-            await update.effective_message.reply_text("? Offer added.", reply_markup=admin_menu())
+            await update.effective_message.reply_text("✅ Offer added.", reply_markup=admin_menu())
 
         elif kind == "offer_edit":
             if "=" not in text:
@@ -1582,27 +1924,29 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if field == "is_active":
                 if value.lower() not in {"true", "false"}: raise ValueError("Use true or false")
                 value = value.lower() == "true"
-            await asyncio.to_thread(admin_mutate, user.id, "PATCH", "bntech_offers",
-                                    {field: value}, {"id": f"eq.{state['id']}"})
+            _require_rows(await asyncio.to_thread(admin_mutate, user.id, "PATCH", "bntech_offers",
+                                                  {field: value}, {"id": f"eq.{state['id']}"}))
             context.user_data.pop("admin_input", None)
-            await update.effective_message.reply_text("? Offer updated.", reply_markup=admin_menu())
+            await update.effective_message.reply_text("✅ Offer updated.", reply_markup=admin_menu())
     except ValueError as exc:
         await update.effective_message.reply_text(
-            f"?? {exc}\nPlease try again, or send /cancel."
+            f"⚠️ {exc}\nPlease try again, or send /cancel."
         )
     except Exception:
         logger.exception("Admin text action failed")
         await update.effective_message.reply_text(
-            "?? Could not save this change. Check CMD logs and Supabase schema/permissions."
+            "⚠️ Could not save this change. Check CMD logs and Supabase schema/permissions."
         )
 
 
 async def cancel_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
-        await update.effective_message.reply_text("? Access Denied! You are not an admin.")
+        await update.effective_message.reply_text("⛔ Access Denied! You are not an admin.")
         return
     context.user_data.pop("admin_input", None)
+    context.user_data.pop("broadcast_source", None)
+    context.user_data.pop("broadcast_waiting_for_content", None)
     await update.effective_message.reply_text("Admin input cancelled.", reply_markup=admin_menu())
 
 
@@ -1633,13 +1977,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif membership is False:
             await query.message.reply_text(
-                "?? You are not showing as a channel member yet. "
+                "⚠️ You are not showing as a channel member yet. "
                 "Please join the channel, then tap Verify Membership again.",
                 reply_markup=channel_gate_keyboard(),
             )
         else:
             await query.message.reply_text(
-                "?? We could not verify your membership right now. "
+                "⚠️ We could not verify your membership right now. "
                 "Please try again shortly.",
                 reply_markup=channel_gate_keyboard(),
             )
@@ -1649,11 +1993,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(query.from_user.id):
         membership = await check_channel_membership(context, query.from_user.id)
         if membership is not True:
-            await query.message.reply_text(
-                "?? Please join our Telegram channel and verify your membership "
-                "before using this bot.",
-                reply_markup=channel_gate_keyboard(),
-            )
+            await show_channel_gate(query.message, check_failed=(membership is None))
             return
 
     if data.startswith("language_"):
@@ -1701,7 +2041,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("broadcast_source", None)
     context.user_data["broadcast_waiting_for_content"] = True
     await message.reply_text(
-        "?? Broadcast draft mode\n\n"
+        "📣 Broadcast draft mode\n\n"
         "Ab text message ya photo/offer poster caption ke saath bhejo.\n"
         "Uske baad bot confirmation dikhayega. Abhi kisi ko message nahi jayega.\n"
         "Cancel karne ke liye /cancel bhejo."
@@ -1726,12 +2066,12 @@ async def broadcast_content_handler(update: Update, context: ContextTypes.DEFAUL
         "message_id": message.message_id,
     }
     await message.reply_text(
-        "Preview draft ready. Ye content available customer IDs ko bheja jayega.\n"
-        "Recipients: unique IDs found in orders + support tickets.\n"
-        "Order/support ticket na banane wale users is list mein nahi honge.",
+        "Preview draft ready. Ye content channel + active subscribers ko bheja jayega.\n"
+        "Recipients: wo users jinhone bot ko /start kiya (bntech_subscribers).\n"
+        "Jinhone bot start nahi kiya wo is list mein nahi honge.",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("? Confirm broadcast", callback_data="broadcast_confirm"),
-            InlineKeyboardButton("? Cancel", callback_data="broadcast_cancel"),
+            InlineKeyboardButton("✅ Confirm broadcast", callback_data="broadcast_confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel"),
         ]]),
     )
 
@@ -1878,69 +2218,59 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def set_broadcast_command_menu(application):
     from telegram import BotCommand, BotCommandScopeChat
 
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("admin", "Open admin panel"),
+        BotCommand("broadcast", "Send a broadcast"),
+        BotCommand("skip", "Skip an optional step"),
+        BotCommand("cancel", "Cancel current action"),
+    ]
     for admin_id in ADMIN_IDS:
-        await application.bot.set_my_commands(
-            [
-                BotCommand("start", "Start the bot"),
-                BotCommand("admin", "Open admin panel"),
-                BotCommand("broadcast", "Send a broadcast"),
-                BotCommand("cancel", "Cancel current action"),
-            ],
-            scope=BotCommandScopeChat(chat_id=admin_id),
-        )
+        try:
+            await application.bot.set_my_commands(
+                commands, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except Exception as exc:
+            # An admin who never opened the bot makes this fail; it must not stop startup.
+            logger.warning("Could not set command menu for an admin: %s", type(exc).__name__)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error while processing an update", exc_info=context.error)
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN .env file mein missing hai.")
-
-    if not WHATSAPP_NUMBER or not normalize_whatsapp_number(WHATSAPP_NUMBER):
-        raise RuntimeError("WHATSAPP_NUMBER .env file mein missing ya invalid hai.")
+    missing = [
+        name for name, value in (
+            ("BOT_TOKEN", BOT_TOKEN),
+            ("SUPABASE_URL", SUPABASE_URL),
+            ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY),
+        ) if not value
+    ]
+    if missing:
+        raise SystemExit("Missing required environment variable(s): " + ", ".join(missing))
+    if not SUPABASE_URL.startswith("https://"):
+        raise SystemExit("SUPABASE_URL must start with https://")
+    if not WHATSAPP_NUMBER:
+        raise SystemExit("WHATSAPP_URL in bot.py is not a valid https://wa.me/<number> link.")
 
     app = Application.builder().token(BOT_TOKEN).post_init(set_broadcast_command_menu).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("skip", admin_skip_command))
+    app.add_handler(CommandHandler("cancel", cancel_admin_input))
     app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^broadcast_(confirm|cancel)$"))
-    app.add_handler(
-        CallbackQueryHandler(admin_button_handler, pattern=r"^admin_")
-    )
+    app.add_handler(CallbackQueryHandler(admin_button_handler, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler((filters.PHOTO | (filters.TEXT & ~filters.COMMAND)), broadcast_content_handler), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler), group=1)
-
-    app.add_handler(CommandHandler("cancel", cancel_admin_input))
+    app.add_error_handler(error_handler)
 
     logger.info("BN Tech Bot is starting...")
     asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling()
 
-# Temporary helper integration from patch_bot.py
-from patch_bot import (
-    get_pending_status,
-    product_buy_buttons,
-    PRODUCT_FIELD_KEYS,
-    PRODUCT_FIELD_CODES,
-    PRODUCT_EDIT_FIELDS,
-    WHATSAPP_NUMBER,
-    WA_MAX_URL_CHARS,
-    WA_MAX_TEXT_CHARS,
-    MAX_PENDING_CONFIRMATIONS,
-    PENDING_CONFIRM_TTL,
-    ORDER_STATUSES,
-    _UUID_RE,
-    _REF_CACHE,
-    _REF_CACHE_LIMIT,
-    normalize_whatsapp_number,
-    build_whatsapp_link,
-    is_valid_whatsapp_url,
-    encode_ref,
-    decode_ref,
-    parse_order_status_callback,
-    status_match_filter,
-    check_transition,
-    store_pending_status,
-)
 
 if __name__ == "__main__":
     main()
